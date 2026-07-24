@@ -1,26 +1,26 @@
 # توكن البوت
-BOT_TOKEN=your_bot_token_here
+BOT_TOKEN=MTUzMDAxNzEwNDAzNDUyOTMyMA.GFozIp.UcgCMBGH7casTMRvLgAWIaXoY6ur8-IfgujchY
 
 # آيدي السيرفر
-GUILD_ID=your_guild_id_here
+GUILD_ID=1527433811540050132
 
 # آيدي روم الانتظار (يمكنك إضافة أكثر من روم بفاصلة)
-WAITING_CHANNEL_ID=1481398869463138604,1519511668823167116
+WAITING_CHANNEL_ID=
 
 # آيدي رتبة الإداريين
 ADMIN_ROLE_ID=your_admin_role_id_here
 
 # آيدي رومات الدعم (مفصولة بفاصلة)
-SUPPORT_CHANNEL_IDS=1499105265272754246,1499105221383819497,1499105170716491806
+SUPPORT_CHANNEL_IDS=1527433812617855000,1527433812617855000
 
 # آيدي روم لوحة الدعم (Board)
-BOARD_CHANNEL_ID=your_board_channel_id_here
+BOARD_CHANNEL_ID=1530027396022009916
 
 # آيدي روم اللوق (سجلات الـ Done والتقييمات)
-LOG_CHANNEL_ID=your_log_channel_id_here
+LOG_CHANNEL_ID=1529517987902521505
 
 # آيدي الكاتاقوري الخاص بالدعم (اختياري)
-SUPPORT_CATEGORY_ID=your_support_category_id_here
+SUPPORT_CATEGORY_ID=1527433812617854998
 
 # آيدي رتبة المواطنين (اختياري)
-CITIZEN_ROLE_ID=your_citizen_role_id_here
+CITIZEN_ROLE_ID=1529504750003945632
