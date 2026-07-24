@@ -1,9 +1,8 @@
 {
-  "name": "voice-support-bot",
-  "version": "2.0.0",
-  "description": "نظام دعم صوتي متكامل مع طابور، تقييم، ونقاط تواجد",
+  "name": "management-bot",
+  "version": "1.0.0",
+  "description": "Voice support bot with queue, ratings, and presence points",
   "main": "index.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
