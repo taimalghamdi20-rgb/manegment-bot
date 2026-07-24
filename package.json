@@ -1,7 +1,7 @@
 {
   "name": "management-bot",
   "version": "1.0.0",
-  "description": "Voice support bot with queue, ratings, and presence points",
+  "description": "بوت متكامل لإدارة الدعم الصوتي مع طابور، تقييم، ونقاط تواجد",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
