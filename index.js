@@ -1,4 +1,3 @@
-require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const {
@@ -20,6 +19,7 @@ const {
 const Database = require('better-sqlite3');
 const db = new Database('data.db');
 
+// إنشاء الجداول إذا لم تكن موجودة
 db.exec(`
   CREATE TABLE IF NOT EXISTS done_counts (
     admin_id TEXT PRIMARY KEY,
@@ -29,45 +29,45 @@ db.exec(`
     user_id TEXT PRIMARY KEY,
     end_date INTEGER
   );
-  CREATE TABLE IF NOT EXISTS presence_points (
-    admin_id TEXT PRIMARY KEY,
-    points INTEGER DEFAULT 0,
-    last_update INTEGER DEFAULT 0
-  );
-  CREATE TABLE IF NOT EXISTS ratings (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    admin_id TEXT,
-    citizen_id TEXT,
-    rating INTEGER,
-    comment TEXT,
-    timestamp INTEGER
-  );
-  CREATE TABLE IF NOT EXISTS queue (
-    position INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT UNIQUE,
-    join_time INTEGER
-  );
 `);
 
-// ===== المتغيرات البيئية =====
+// ===== قراءة المتغيرات من بيئة التشغيل (بدون .env) =====
 const {
   BOT_TOKEN,
   GUILD_ID,
   WAITING_CHANNEL_ID,
   ADMIN_ROLE_ID,
-  SUPPORT_CATEGORY_ID,
-  LOG_CHANNEL_ID,
-  BOARD_CHANNEL_ID,
+  CITIZEN_ROLE_ID,
 } = process.env;
 
+// فحص المتغيرات الأساسية
 if (!BOT_TOKEN || !GUILD_ID || !WAITING_CHANNEL_ID || !ADMIN_ROLE_ID) {
-  console.error('❌ تأكد من تعبئة جميع المتغيرات في ملف .env');
+  console.error('❌ تأكد من تعبئة المتغيرات التالية في بيئة التشغيل:');
+  console.error('BOT_TOKEN, GUILD_ID, WAITING_CHANNEL_ID, ADMIN_ROLE_ID');
   process.exit(1);
 }
 
-// ===== إعدادات ثابتة =====
+// ===== إضافة رومات الانتظار الإضافية (ثابتة) =====
+const ADDITIONAL_WAITING_IDS = [
+  '1481398869463138604',
+  '1519511668823167116'
+];
+
+const WAITING_CHANNEL_IDS = [
+  ...WAITING_CHANNEL_ID.split(',').map(id => id.trim()).filter(Boolean),
+  ...ADDITIONAL_WAITING_IDS
+];
+
+// ===== إعدادات ثابتة (لا تحتاج إلى env) =====
+const RATING_CHANNEL_ID = '1529482677516898555';
+const LEAVE_EMBED_CHANNEL_ID = '1529495796247167178';
+const LEAVE_PANEL_CHANNEL_ID = '1529440458030321714';
+const LEAVE_ROLE_ID = '1459304469127758027';
+const RESIGNATION_KEEP_ROLE_ID = '1476796533168017428';
 const STAFF_ROLE_IDS = ['1459304407899443396', '1459304410923532481'];
-const SUPPORT_ROOM_IDS = [
+const DONE_TEXT_CHANNEL_ID = '1529933848144510976'; // روم الإدارة
+
+const ADMIN_ROOM_IDS = [
   '1499105265272754246',
   '1499105221383819497',
   '1499105170716491806',
@@ -81,9 +81,13 @@ const SUPPORT_ROOM_IDS = [
   '1519516030899191809',
   '1519516058682130632',
 ];
-const WAITING_IDS = WAITING_CHANNEL_ID.split(',').map(id => id.trim()).filter(Boolean);
-const POINTS_INTERVAL = 15 * 60 * 1000; // 15 دقيقة
-const RATING_COOLDOWN = 30 * 60 * 1000; // 30 دقيقة بين التقييمات
+
+const MAX_LEAVE_DAYS = 14;
+const LEAVE_PANEL_COLOR = 0xC2410C;
+const LEAVE_BANNER_PATH = path.join(__dirname, 'leave_banner.png');
+const LEAVE_BANNER_FILENAME = 'leave_banner.png';
+const SERVER_LOGO_PATH = path.join(__dirname, 'server_logo.png');
+const SERVER_LOGO_FILENAME = 'server_logo.png';
 
 // ===== دوال قاعدة البيانات =====
 function loadDoneCounts() {
@@ -103,23 +107,6 @@ function saveDoneCounts() {
   trans(doneCounts.entries());
 }
 
-function loadPresencePoints() {
-  const stmt = db.prepare('SELECT admin_id, points, last_update FROM presence_points');
-  const rows = stmt.all();
-  const map = new Map();
-  for (const row of rows) map.set(row.admin_id, { points: row.points, lastUpdate: row.last_update });
-  return map;
-}
-
-function savePresencePoints() {
-  db.prepare('DELETE FROM presence_points').run();
-  const insert = db.prepare('INSERT INTO presence_points (admin_id, points, last_update) VALUES (?, ?, ?)');
-  const trans = db.transaction((entries) => {
-    for (const [id, data] of entries) insert.run(id, data.points, data.lastUpdate);
-  });
-  trans(presencePoints.entries());
-}
-
 function loadActiveLeaves() {
   const stmt = db.prepare('SELECT user_id, end_date FROM active_leaves');
   const rows = stmt.all();
@@ -137,62 +124,14 @@ function saveActiveLeaves() {
   trans(activeLeaves.entries());
 }
 
-function addRating(adminId, citizenId, rating, comment = '') {
-  const stmt = db.prepare('INSERT INTO ratings (admin_id, citizen_id, rating, comment, timestamp) VALUES (?, ?, ?, ?, ?)');
-  stmt.run(adminId, citizenId, rating, comment, Date.now());
-}
-
-function getAdminRatings(adminId) {
-  const stmt = db.prepare('SELECT rating FROM ratings WHERE admin_id = ?');
-  const rows = stmt.all(adminId);
-  if (rows.length === 0) return { avg: 0, count: 0 };
-  const sum = rows.reduce((a, r) => a + r.rating, 0);
-  return { avg: sum / rows.length, count: rows.length };
-}
-
-function getQueue() {
-  const stmt = db.prepare('SELECT user_id, join_time FROM queue ORDER BY position ASC');
-  return stmt.all();
-}
-
-function addToQueue(userId) {
-  const exists = db.prepare('SELECT user_id FROM queue WHERE user_id = ?').get(userId);
-  if (exists) return false;
-  const stmt = db.prepare('INSERT INTO queue (user_id, join_time) VALUES (?, ?)');
-  stmt.run(userId, Date.now());
-  return true;
-}
-
-function removeFromQueue(userId) {
-  const stmt = db.prepare('DELETE FROM queue WHERE user_id = ?');
-  stmt.run(userId);
-}
-
-function getQueuePosition(userId) {
-  const stmt = db.prepare('SELECT position FROM queue WHERE user_id = ?');
-  const row = stmt.get(userId);
-  return row ? row.position : null;
-}
-
-// ===== تحميل البيانات =====
+// تحميل البيانات
 const doneCounts = loadDoneCounts();
-const presencePoints = loadPresencePoints();
 const activeLeaves = loadActiveLeaves();
 const evaluatedLogs = new Set();
 
 // ===== دوال مساعدة =====
 function hasStaffRole(member) {
   return STAFF_ROLE_IDS.some((roleId) => member.roles.cache.has(roleId));
-}
-
-function isMutedOrDeafened(vs) {
-  if (!vs) return false;
-  return vs.selfMute || vs.selfDeaf || vs.serverMute || vs.serverDeaf;
-}
-
-function isDeafened(vs) {
-  if (!vs) return false;
-  return vs.selfDeaf || vs.serverDeaf;
 }
 
 function ratingStarsBar(rating) {
@@ -210,30 +149,57 @@ function ratingLabel(rating) {
   return labels[rating] || '';
 }
 
-// ===== دوال البورد =====
-async function updateBoard(guild) {
-  const channel = guild.channels.cache.get(BOARD_CHANNEL_ID);
-  if (!channel) return;
-  const queue = getQueue();
-  const waitingCount = queue.length;
-  const waitingNames = queue.map((q, i) => `${i + 1}. <@${q.user_id}>`).join('\n') || 'لا يوجد أحد';
+function isMutedOrDeafened(vs) {
+  if (!vs) return false;
+  return vs.selfMute || vs.selfDeaf || vs.serverMute || vs.serverDeaf;
+}
 
-  const embed = new EmbedBuilder()
-    .setColor(0x5865f2)
-    .setTitle('# 🎙️ نظام الدعم الصوتي')
-    .setDescription(`**حالة الدعم:** ${waitingCount > 0 ? '🟢 مشغول' : '🟢 متاح'}\n**اللاعبين في الانتظار:** ${waitingCount}`)
-    .addFields(
-      { name: '📋 قائمة الانتظار', value: waitingNames, inline: false },
-      { name: '⏳ تنبيه', value: 'يرجى البقاء في روم الانتظار، سيتم سحبك تلقائياً عند توفر إداري.', inline: false }
-    )
-    .setFooter({ text: 'يتم التحديث تلقائياً - ' + new Date().toLocaleString() });
+function isDeafened(vs) {
+  if (!vs) return false;
+  return vs.selfDeaf || vs.serverDeaf;
+}
 
-  const messages = await channel.messages.fetch({ limit: 10 });
-  const botMsg = messages.find(m => m.author.bot && m.embeds.length > 0);
-  if (botMsg) {
-    await botMsg.edit({ embeds: [embed] });
-  } else {
-    await channel.send({ embeds: [embed] });
+// ===== دوال السحب =====
+function getNextEligibleWaitingMember(guild) {
+  for (const waitingId of WAITING_CHANNEL_IDS) {
+    const channel = guild.channels.cache.get(waitingId);
+    if (!channel || !channel.members) continue;
+    for (const [, member] of channel.members) {
+      if (!isMutedOrDeafened(member.voice)) return member;
+    }
+  }
+  return null;
+}
+
+function isFreeAdminRoom(channel) {
+  if (!channel || channel.type !== 2 || !ADMIN_ROOM_IDS.includes(channel.id)) return false;
+  const members = [...channel.members.values()];
+  if (members.length !== 1) return false;
+  const admin = members[0];
+  if (!admin.roles.cache.has(ADMIN_ROLE_ID) || isDeafened(admin.voice)) return false;
+  return true;
+}
+
+const pullLocks = new Set();
+const activeSessions = new Map();
+
+async function tryPullForAllFreeAdmins(guild) {
+  for (const roomId of ADMIN_ROOM_IDS) {
+    const channel = guild.channels.cache.get(roomId);
+    if (!channel || !isFreeAdminRoom(channel) || pullLocks.has(channel.id)) continue;
+    const candidate = getNextEligibleWaitingMember(guild);
+    if (!candidate) continue;
+    pullLocks.add(channel.id);
+    try {
+      const admin = channel.members.first();
+      await candidate.voice.setChannel(channel.id, 'سحب تلقائي');
+      activeSessions.set(candidate.id, { adminId: admin.id, startTime: Date.now() });
+      console.log(`✅ تم سحب ${candidate.user.tag} إلى ${channel.name} (الإداري: ${admin.user.tag})`);
+    } catch (err) {
+      console.error(`⚠️ فشل سحب ${candidate.user.tag}:`, err.message);
+    } finally {
+      pullLocks.delete(channel.id);
+    }
   }
 }
 
@@ -248,131 +214,49 @@ const client = new Client({
   ],
 });
 
-const pullLocks = new Set();
-const activeSessions = new Map();
-const presenceTimers = new Map();
+// ============================================================
+// حماية روم الإجازات
+// ============================================================
+client.on(Events.MessageCreate, async (message) => {
+  if (message.guild && message.channelId === LEAVE_EMBED_CHANNEL_ID) {
+    if (message.author.bot) return;
+    if (!hasStaffRole(message.member)) {
+      try { await message.delete(); } catch (e) { console.error('❌ فشل حذف الرسالة:', e); }
+    }
+  }
+});
 
 // ============================================================
-// الأحداث
-// ============================================================
-
 // تسجيل الأوامر
+// ============================================================
 client.once(Events.ClientReady, async (c) => {
   console.log(`🤖 البوت شغال باسم ${c.user.tag}`);
   try {
     const commands = [
-      { name: 'queue', description: 'عرض قائمة الانتظار الحالية' },
-      { name: 'board', description: 'إرسال لوحة الدعم في الروم المخصص' },
-      { name: 'leave', description: 'طلب إجازة (للإداريين فقط)' },
-      { name: 'resign', description: 'طلب استقالة (للإداريين فقط)' },
-      { name: 'break_leave', description: 'طلب كسر إجازة (للإداريين فقط)' },
-      { name: 'active_leaves', description: 'عرض الإداريين في إجازة' },
-      { name: 'done_stats', description: 'عرض إحصائيات الـ Done' },
-      { name: 'points', description: 'عرض نقاط التواجد الخاصة بك' },
-      { name: 'points_leaderboard', description: 'عرض ترتيب النقاط' },
-      { name: 'add_done', description: 'إضافة Done لإداري', options: [{ name: 'admin', type: 6, required: true }, { name: 'amount', type: 4, required: true }] },
-      { name: 'remove_done', description: 'خصم Done من إداري', options: [{ name: 'admin', type: 6, required: true }, { name: 'amount', type: 4, required: true }] },
-      { name: 'reset_all', description: 'تصفير جميع الإحصائيات' },
+      { name: 'send_leave_panel', description: 'إرسال لوحة طلبات الإجازات والاستقالات' },
+      { name: 'active_leaves', description: 'عرض قائمة الإداريين المجازين' },
+      { name: 'top_done', description: 'عرض أكثر 10 إداريين إنجازاً' },
+      { name: 'all_dones', description: 'عرض إحصائيات جميع الإداريين' },
+      { name: 'add_done', description: 'إضافة عدد من الـ Done لإداري', options: [{ name: 'admin', type: 6, required: true }, { name: 'amount', type: 4, required: true }] },
+      { name: 'remove_done', description: 'خصم عدد من الـ Done من إداري', options: [{ name: 'admin', type: 6, required: true }, { name: 'amount', type: 4, required: true }] },
+      { name: 'reset_all', description: 'تصفير جميع إحصائيات الـ Done' }
     ];
     await c.application.commands.set(commands, GUILD_ID);
     console.log('✅ تم تسجيل الأوامر.');
   } catch (error) {
     console.error('❌ خطأ في تسجيل الأوامر:', error);
   }
-
-  // تحديث البورد كل 30 ثانية
-  setInterval(() => {
-    const guild = client.guilds.cache.get(GUILD_ID);
-    if (guild) updateBoard(guild);
-  }, 30000);
 });
 
-// حركة الصوت (الطابور، السحب، النقاط، التقييم)
+// ============================================================
+// حركة الصوت – التسجيل الفوري للـ Done
+// ============================================================
 client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
   const guild = newState.guild || oldState.guild;
   if (!guild || guild.id !== GUILD_ID) return;
   const userId = newState.id;
-  const oldChannelId = oldState.channelId;
-  const newChannelId = newState.channelId;
 
-  // ===== 1. إدارة الطابور =====
-  // دخول إلى روم الانتظار
-  if (newChannelId && WAITING_IDS.includes(newChannelId) && !oldChannelId) {
-    const member = await guild.members.fetch(userId);
-    if (!member.roles.cache.has(ADMIN_ROLE_ID)) {
-      addToQueue(userId);
-      console.log(`➕ تم إضافة ${member.user.tag} إلى الطابور`);
-      await updateBoard(guild);
-    }
-  }
-  // خروج من روم الانتظار
-  if (oldChannelId && WAITING_IDS.includes(oldChannelId) && !newChannelId) {
-    removeFromQueue(userId);
-    console.log(`➖ تم إزالة ${userId} من الطابور`);
-    await updateBoard(guild);
-  }
-
-  // ===== 2. السحب التلقائي =====
-  if (newChannelId && SUPPORT_ROOM_IDS.includes(newChannelId)) {
-    const channel = guild.channels.cache.get(newChannelId);
-    const members = [...channel.members.values()];
-    if (members.length === 1 && members[0].roles.cache.has(ADMIN_ROLE_ID)) {
-      const queue = getQueue();
-      if (queue.length > 0) {
-        const next = queue[0];
-        const citizen = await guild.members.fetch(next.user_id);
-        if (citizen && citizen.voice.channel && WAITING_IDS.includes(citizen.voice.channel.id)) {
-          try {
-            await citizen.voice.setChannel(newChannelId, 'سحب تلقائي إلى الدعم');
-            removeFromQueue(citizen.id);
-            activeSessions.set(citizen.id, { adminId: members[0].id, startTime: Date.now() });
-            console.log(`✅ تم سحب ${citizen.user.tag} إلى ${channel.name}`);
-
-            // إرسال إشعار للمواطن
-            try {
-              const embed = new EmbedBuilder()
-                .setColor(0x5865f2)
-                .setTitle('🎙️ تم سحبك إلى الدعم')
-                .setDescription(`تم سحبك إلى روم الدعم **${channel.name}** مع الإداري <@${members[0].id}>.\nجهّز ملاحظاتك وأسئلتك، وابدأ الجلسة.`);
-              await citizen.send({ embeds: [embed] });
-            } catch (e) {}
-
-            await updateBoard(guild);
-          } catch (err) {
-            console.error(`⚠️ فشل سحب ${citizen.user.tag}:`, err.message);
-          }
-        }
-      }
-    }
-  }
-
-  // ===== 3. نظام نقاط التواجد =====
-  if (newChannelId && SUPPORT_ROOM_IDS.includes(newChannelId)) {
-    const member = await guild.members.fetch(userId);
-    if (member.roles.cache.has(ADMIN_ROLE_ID) && !isMutedOrDeafened(newState)) {
-      if (!presenceTimers.has(userId)) {
-        const timer = setInterval(() => {
-          const data = presencePoints.get(userId) || { points: 0, lastUpdate: Date.now() };
-          data.points += 1;
-          data.lastUpdate = Date.now();
-          presencePoints.set(userId, data);
-          savePresencePoints();
-          console.log(`⭐ تم إضافة نقطة للإداري ${member.user.tag}`);
-        }, POINTS_INTERVAL);
-        presenceTimers.set(userId, timer);
-      }
-    }
-  }
-  if (oldChannelId && SUPPORT_ROOM_IDS.includes(oldChannelId) && (!newChannelId || !SUPPORT_ROOM_IDS.includes(newChannelId))) {
-    if (presenceTimers.has(userId)) {
-      clearInterval(presenceTimers.get(userId));
-      presenceTimers.delete(userId);
-      console.log(`⏹️ توقفت نقاط التواجد للإداري ${userId}`);
-    }
-  }
-
-  // ===== 4. إنهاء الجلسة وتسجيل الـ Done والتقييم =====
-  if (activeSessions.has(userId) && newChannelId !== oldChannelId) {
+  if (activeSessions.has(userId) && newState.channelId !== oldState.channelId) {
     const { adminId, startTime } = activeSessions.get(userId);
     activeSessions.delete(userId);
 
@@ -385,10 +269,9 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
     doneCounts.set(adminId, current);
     saveDoneCounts();
 
-    // إرسال سجل الـ Done
     let logMsg = null;
     try {
-      const channel = guild.channels.cache.get(LOG_CHANNEL_ID);
+      const channel = guild.channels.cache.get(DONE_TEXT_CHANNEL_ID);
       if (channel) {
         const embed = new EmbedBuilder()
           .setColor(0x57f287)
@@ -405,7 +288,6 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
       }
     } catch (e) { console.error('❌ خطأ في إرسال سجل الـ Done:', e); }
 
-    // إرسال رسالة تقييم خاصة للمواطن
     try {
       const user = await client.users.fetch(userId);
       const logId = logMsg ? logMsg.id : 'none';
@@ -432,14 +314,18 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
       }
     }
   }
+
+  try { await tryPullForAllFreeAdmins(guild); } catch (e) { console.error('خطأ في السحب:', e); }
 });
 
 // ============================================================
-// التفاعلات
+// التفاعلات (الأزرار، المودالات، الأوامر) – الكود الكامل
 // ============================================================
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
-    // ===== أزرار التقييم =====
+    // --------------------------------------------------------
+    // 1. أزرار التقييم (rate_*)
+    // --------------------------------------------------------
     if (interaction.isButton() && interaction.customId.startsWith('rate_')) {
       const parts = interaction.customId.split('_');
       const rating = parseInt(parts[1]);
@@ -451,36 +337,32 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return interaction.reply({ content: '⚠️ تم تقييم هذه الخدمة مسبقاً.', ephemeral: true });
       }
       evaluatedLogs.add(logId);
+      await interaction.update({ content: `✅ شكراً! (${stars})`, embeds: [], components: [] });
 
-      // حفظ التقييم في قاعدة البيانات
-      addRating(adminId, interaction.user.id, rating);
-
-      await interaction.update({ content: `✅ شكراً لتقييمك! (${stars})`, embeds: [], components: [] });
-
-      // إرسال التقييم إلى روم اللوق
       try {
         const guild = client.guilds.cache.get(GUILD_ID);
-        const channel = guild.channels.cache.get(LOG_CHANNEL_ID);
+        const channel = guild.channels.cache.get(RATING_CHANNEL_ID);
         if (channel) {
+          const file = new AttachmentBuilder(SERVER_LOGO_PATH, { name: SERVER_LOGO_FILENAME });
           const embed = new EmbedBuilder()
             .setColor(ratingColor(rating))
             .setAuthor({ name: `${interaction.user.username} قيّم الخدمة`, iconURL: interaction.user.displayAvatarURL() })
             .setTitle('🌟 تقييم إداري')
+            .setThumbnail(`attachment://${SERVER_LOGO_FILENAME}`)
             .addFields(
               { name: 'المواطن', value: `<@${interaction.user.id}>`, inline: true },
               { name: 'الإداري', value: `<@${adminId}>`, inline: true },
               { name: '⭐ التقييم', value: `${stars}\n\`${rating}/5\` — ${ratingLabel(rating)}`, inline: false }
             )
             .setTimestamp();
-          await channel.send({ embeds: [embed] });
+          await channel.send({ embeds: [embed], files: [file] });
         }
       } catch (e) { console.error('❌ خطأ في إرسال التقييم:', e); }
 
-      // تحديث سجل الـ Done
       try {
         if (logId && logId !== 'none') {
           const guild = client.guilds.cache.get(GUILD_ID);
-          const channel = guild.channels.cache.get(LOG_CHANNEL_ID);
+          const channel = guild.channels.cache.get(DONE_TEXT_CHANNEL_ID);
           if (channel) {
             const msg = await channel.messages.fetch(logId);
             if (msg) {
@@ -496,289 +378,508 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    // ===== زر إنهاء الجلسة =====
-    if (interaction.isButton() && interaction.customId === 'end_session') {
-      const member = interaction.member;
-      if (!hasStaffRole(member)) {
-        return interaction.reply({ content: '❌ هذا الزر خاص بالإداريين فقط.', ephemeral: true });
-      }
-      const voiceChannel = member.voice.channel;
-      if (!voiceChannel || !SUPPORT_ROOM_IDS.includes(voiceChannel.id)) {
-        return interaction.reply({ content: '❌ يجب أن تكون في روم دعم لإنهاء الجلسة.', ephemeral: true });
-      }
-      const citizens = [...voiceChannel.members.values()].filter(m => !hasStaffRole(m));
-      if (citizens.length === 0) {
-        return interaction.reply({ content: '⚠️ لا يوجد مواطن في روم الدعم لإنهاء جلساته.', ephemeral: true });
-      }
-      for (const citizen of citizens) {
-        try {
-          await citizen.voice.setChannel(null, 'إنهاء الجلسة من قبل الإداري');
-          // سيتم تسجيل الـ Done تلقائياً عبر حدث VoiceStateUpdate
-        } catch (e) {
-          console.error('❌ فشل إخراج المواطن:', e);
-        }
-      }
-      await interaction.reply({ content: `✅ تم إنهاء الجلسة وإخراج ${citizens.length} مواطن.`, ephemeral: true });
+    // --------------------------------------------------------
+    // 2. أزرار فتح المودالات (طلب إجازة، استقالة، كسر إجازة)
+    // --------------------------------------------------------
+    if (interaction.customId === 'open_leave_modal') {
+      const modal = new ModalBuilder()
+        .setCustomId('leave_modal')
+        .setTitle('📄 طلب إجازة');
+
+      const durationInput = new TextInputBuilder()
+        .setCustomId('leave_duration')
+        .setLabel(`عدد أيام الإجازة (أقصى حد ${MAX_LEAVE_DAYS} أيام)`)
+        .setStyle(TextInputStyle.Short)
+        .setPlaceholder('مثال: 3')
+        .setRequired(true)
+        .setMaxLength(2);
+
+      const reasonInput = new TextInputBuilder()
+        .setCustomId('leave_reason')
+        .setLabel('سبب الإجازة')
+        .setStyle(TextInputStyle.Paragraph)
+        .setPlaceholder('اكتب سبب طلب الإجازة بالتفصيل')
+        .setRequired(true)
+        .setMaxLength(500);
+
+      modal.addComponents(
+        new ActionRowBuilder().addComponents(durationInput),
+        new ActionRowBuilder().addComponents(reasonInput)
+      );
+
+      await interaction.showModal(modal);
       return;
     }
 
-    // ===== الأوامر =====
-    if (interaction.isChatInputCommand()) {
-      const { commandName } = interaction;
+    if (interaction.customId === 'open_resign_modal') {
+      const modal = new ModalBuilder()
+        .setCustomId('resign_modal')
+        .setTitle('📝 طلب استقالة');
 
-      // 1. عرض الطابور
-      if (commandName === 'queue') {
-        const queue = getQueue();
-        if (queue.length === 0) {
-          return interaction.reply({ content: '📭 لا يوجد أحد في قائمة الانتظار حالياً.', ephemeral: true });
-        }
-        const list = queue.map((q, i) => `${i + 1}. <@${q.user_id}>`).join('\n');
-        const embed = new EmbedBuilder()
-          .setColor(0x5865f2)
-          .setTitle('📋 قائمة الانتظار')
-          .setDescription(list)
-          .setFooter({ text: `إجمالي المنتظرين: ${queue.length}` });
-        return interaction.reply({ embeds: [embed] });
+      const reasonInput = new TextInputBuilder()
+        .setCustomId('resign_reason')
+        .setLabel('سبب الاستقالة')
+        .setStyle(TextInputStyle.Paragraph)
+        .setPlaceholder('اكتب سبب تقديم الاستقالة بالتفصيل')
+        .setRequired(true)
+        .setMaxLength(500);
+
+      modal.addComponents(new ActionRowBuilder().addComponents(reasonInput));
+
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.customId === 'open_break_modal') {
+      const modal = new ModalBuilder()
+        .setCustomId('break_modal')
+        .setTitle('🔓 طلب كسر إجازة');
+
+      const reasonInput = new TextInputBuilder()
+        .setCustomId('break_reason')
+        .setLabel('سبب كسر الإجازة')
+        .setStyle(TextInputStyle.Paragraph)
+        .setPlaceholder('اكتب سبب كسر الإجازة بالتفصيل')
+        .setRequired(true)
+        .setMaxLength(500);
+
+      modal.addComponents(new ActionRowBuilder().addComponents(reasonInput));
+
+      await interaction.showModal(modal);
+      return;
+    }
+
+    // --------------------------------------------------------
+    // 3. أزرار قبول/رفض الطلبات
+    // --------------------------------------------------------
+    if (interaction.customId.startsWith('req_accept_') || interaction.customId.startsWith('req_reject_')) {
+      if (!hasStaffRole(interaction.member)) {
+        return interaction.reply({
+          content: '❌ هذا الإجراء خاص بأصحاب صلاحية الإدارة فقط.',
+          ephemeral: true,
+        });
       }
 
-      // 2. إرسال البورد
-      if (commandName === 'board') {
-        if (!hasStaffRole(interaction.member)) {
-          return interaction.reply({ content: '❌ هذا الأمر للإدارة فقط.', ephemeral: true });
-        }
-        await updateBoard(interaction.guild);
-        return interaction.reply({ content: '✅ تم تحديث لوحة الدعم.', ephemeral: true });
+      const parts = interaction.customId.split('_');
+      const decision = parts[1];
+      const reqType = parts[2];
+      const requesterId = parts[3];
+
+      const isAccept = decision === 'accept';
+      const decisionLabel = isAccept ? '✅ تم القبول' : '❌ تم الرفض';
+      const decisionColor = isAccept ? 0x2ecc71 : 0xe74c3c;
+
+      const originalEmbed = EmbedBuilder.from(interaction.message.embeds[0]);
+      const fields = originalEmbed.data.fields || [];
+      const statusIndex = fields.findIndex((f) => f.name.includes('الحالة') || f.name.includes('Status'));
+      const statusValue = `\`\`\`\n${decisionLabel} بواسطة ${interaction.user.username}\n\`\`\``;
+
+      if (statusIndex >= 0) {
+        fields[statusIndex].value = statusValue;
+      } else {
+        fields.push({ name: 'الحالة', value: statusValue });
       }
 
-      // 3. طلب إجازة
-      if (commandName === 'leave') {
-        if (!hasStaffRole(interaction.member)) {
-          return interaction.reply({ content: '❌ هذا الأمر للإدارة فقط.', ephemeral: true });
+      originalEmbed.setFields(fields);
+      originalEmbed.setColor(decisionColor);
+
+      const oldComponents = interaction.message.components[0].components;
+      const disabledRow = new ActionRowBuilder().addComponents(
+        oldComponents.map((btn) => ButtonBuilder.from(btn).setDisabled(true))
+      );
+
+      await interaction.update({ embeds: [originalEmbed], components: [disabledRow] });
+
+      let roleActionNote = '';
+      if (isAccept) {
+        try {
+          const targetMember = await interaction.guild.members.fetch(requesterId);
+
+          if (reqType === 'leave') {
+            await targetMember.roles.add(LEAVE_ROLE_ID, 'قبول طلب إجازة');
+            roleActionNote = `\n🏷️ تم تحديث حالتك إلى: **Out of service ✈️**`;
+
+            const durationField = originalEmbed.data.fields.find(f => f.name.includes('المدة'));
+            if (durationField) {
+              const match = durationField.value.match(/\d+/);
+              if (match) {
+                const durationDays = parseInt(match[0]);
+                const endDate = Date.now() + (durationDays * 24 * 60 * 60 * 1000);
+                activeLeaves.set(requesterId, { endDate });
+                saveActiveLeaves();
+              }
+            }
+
+          } else if (reqType === 'resign') {
+            await targetMember.roles.set([RESIGNATION_KEEP_ROLE_ID], 'قبول طلب استقالة');
+            roleActionNote = `\n🏷️ تم تحديث حالتك إلى: **𝗪𝗵𝗶𝘁𝗲𝗹𝗶𝘀𝘁𝗲𝗱**`;
+          } else if (reqType === 'break') {
+            if (targetMember.roles.cache.has(LEAVE_ROLE_ID)) {
+              await targetMember.roles.remove(LEAVE_ROLE_ID, 'قبول طلب كسر إجازة');
+              roleActionNote = `\n🏷️ تم سحب رتبة <@&${LEAVE_ROLE_ID}> منك (العودة من الإجازة).`;
+            }
+            if (activeLeaves.has(requesterId)) {
+              activeLeaves.delete(requesterId);
+              saveActiveLeaves();
+            }
+          }
+        } catch (roleErr) {
+          console.error('⚠️ خطأ أثناء تعديل الرتب:', roleErr);
         }
-        // فتح مودال
-        const modal = new ModalBuilder()
-          .setCustomId('leave_modal')
-          .setTitle('📄 طلب إجازة');
-        const durationInput = new TextInputBuilder()
-          .setCustomId('leave_duration')
-          .setLabel('عدد الأيام (أقصى 14)')
-          .setStyle(TextInputStyle.Short)
-          .setPlaceholder('مثال: 3')
-          .setRequired(true)
-          .setMaxLength(2);
-        const reasonInput = new TextInputBuilder()
-          .setCustomId('leave_reason')
-          .setLabel('السبب')
-          .setStyle(TextInputStyle.Paragraph)
-          .setPlaceholder('اكتب سبب الإجازة')
-          .setRequired(true)
-          .setMaxLength(500);
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(durationInput),
-          new ActionRowBuilder().addComponents(reasonInput)
+      }
+
+      try {
+        const requesterUser = await client.users.fetch(requesterId);
+        const typeLabels = { leave: 'إجازة', resign: 'استقالة', break: 'كسر إجازة' };
+        const typeLabel = typeLabels[reqType] || 'إجازة';
+
+        const dmEmbed = new EmbedBuilder()
+          .setTitle(isAccept ? '🎉 تم قبول طلبك' : '❌ تم رفض طلبك')
+          .setColor(isAccept ? 0x2ecc71 : 0xe74c3c)
+          .setDescription(
+            isAccept
+              ? `تهانينا! تم قبول طلب **الـ ${typeLabel}** الخاص بك.${roleActionNote}`
+              : `للأسف، تم رفض طلب **الـ ${typeLabel}** الخاص بك.`
+          )
+          .addFields(
+            { name: 'المسؤول', value: `<@${interaction.user.id}>`, inline: true },
+            { name: 'نوع الطلب', value: `طلب ${typeLabel}`, inline: true }
+          )
+          .setTimestamp();
+
+        await requesterUser.send({ embeds: [dmEmbed] });
+      } catch (e) {
+        console.error('⚠️ تعذر إرسال الرسالة لخاص العضو.');
+      }
+      return;
+    }
+
+    // --------------------------------------------------------
+    // 4. المودالات (النماذج)
+    // --------------------------------------------------------
+    if (interaction.isModalSubmit()) {
+      const requestsChannel = await interaction.guild.channels.fetch(LEAVE_PANEL_CHANNEL_ID);
+
+      const buildApplicationEmbed = (typeTitle, fieldsData) => {
+        return new EmbedBuilder()
+          .setColor(0x2f3136)
+          .setTitle(`📨 A new application has been submitted. (${typeTitle})`)
+          .setDescription(`**From:** <@${interaction.user.id}>\n\`( ${interaction.user.username} )\``)
+          .addFields(fieldsData)
+          .setFooter({
+            text: `Submitted by ${interaction.user.username}`,
+            iconURL: interaction.user.displayAvatarURL({ dynamic: true })
+          })
+          .setTimestamp();
+      };
+
+      if (interaction.customId === 'leave_modal') {
+        const durationRaw = interaction.fields.getTextInputValue('leave_duration').trim();
+        const reason = interaction.fields.getTextInputValue('leave_reason').trim();
+        const duration = Number(durationRaw);
+
+        if (!Number.isInteger(duration) || duration < 1) {
+          return await interaction.reply({
+            content: '❌ لازم تكتب عدد أيام صحيح (رقم صحيح 1 أو أكثر).',
+            ephemeral: true,
+          });
+        }
+
+        if (duration > MAX_LEAVE_DAYS) {
+          return await interaction.reply({
+            content: `❌ ما يصير تطلب إجازة أكثر من ${MAX_LEAVE_DAYS} أيام. الرجاء إعادة المحاولة بمدة أقل.`,
+            ephemeral: true,
+          });
+        }
+
+        const embed = buildApplicationEmbed('طلب إجازة', [
+          { name: 'المدة', value: `\`\`\`\n${duration} ${duration === 1 ? 'يوم' : 'أيام'}\n\`\`\`` },
+          { name: 'سبب الإجازة', value: `\`\`\`\n${reason}\n\`\`\`` },
+          { name: 'الحالة', value: `\`\`\`\n⏳ بانتظار مراجعة الإدارة\n\`\`\`` }
+        ]);
+
+        const decisionRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`req_accept_leave_${interaction.user.id}`)
+            .setLabel('قبول')
+            .setStyle(ButtonStyle.Success),
+          new ButtonBuilder()
+            .setCustomId(`req_reject_leave_${interaction.user.id}`)
+            .setLabel('رفض')
+            .setStyle(ButtonStyle.Danger)
         );
-        return await interaction.showModal(modal);
+
+        await requestsChannel.send({ embeds: [embed], components: [decisionRow] });
+
+        return await interaction.reply({
+          content: '✅ تم إرسال طلب الإجازة بنجاح إلى روم المسؤولين، بانتظار مراجعة الإدارة.',
+          ephemeral: true,
+        });
       }
 
-      // 4. طلب استقالة
-      if (commandName === 'resign') {
-        if (!hasStaffRole(interaction.member)) {
-          return interaction.reply({ content: '❌ هذا الأمر للإدارة فقط.', ephemeral: true });
-        }
-        const modal = new ModalBuilder()
-          .setCustomId('resign_modal')
-          .setTitle('📝 طلب استقالة');
-        const reasonInput = new TextInputBuilder()
-          .setCustomId('resign_reason')
-          .setLabel('السبب')
-          .setStyle(TextInputStyle.Paragraph)
-          .setPlaceholder('اكتب سبب الاستقالة')
-          .setRequired(true)
-          .setMaxLength(500);
-        modal.addComponents(new ActionRowBuilder().addComponents(reasonInput));
-        return await interaction.showModal(modal);
+      if (interaction.customId === 'resign_modal') {
+        const reason = interaction.fields.getTextInputValue('resign_reason').trim();
+
+        const embed = buildApplicationEmbed('طلب استقالة', [
+          { name: 'سبب الاستقالة', value: `\`\`\`\n${reason}\n\`\`\`` },
+          { name: 'الحالة', value: `\`\`\`\n⏳ بانتظار مراجعة الإدارة\n\`\`\`` }
+        ]);
+
+        const decisionRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`req_accept_resign_${interaction.user.id}`)
+            .setLabel('قبول')
+            .setStyle(ButtonStyle.Success),
+          new ButtonBuilder()
+            .setCustomId(`req_reject_resign_${interaction.user.id}`)
+            .setLabel('رفض')
+            .setStyle(ButtonStyle.Danger)
+        );
+
+        await requestsChannel.send({ embeds: [embed], components: [decisionRow] });
+
+        return await interaction.reply({
+          content: '✅ تم إرسال طلب الاستقالة بنجاح إلى روم المسؤولين، بانتظار مراجعة الإدارة.',
+          ephemeral: true,
+        });
       }
 
-      // 5. طلب كسر إجازة
-      if (commandName === 'break_leave') {
+      if (interaction.customId === 'break_modal') {
+        const reason = interaction.fields.getTextInputValue('break_reason').trim();
+
+        const embed = buildApplicationEmbed('طلب كسر إجازة', [
+          { name: 'سبب كسر الإجازة', value: `\`\`\`\n${reason}\n\`\`\`` },
+          { name: 'الحالة', value: `\`\`\`\n⏳ بانتظار مراجعة الإدارة\n\`\`\`` }
+        ]);
+
+        const decisionRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`req_accept_break_${interaction.user.id}`)
+            .setLabel('قبول')
+            .setStyle(ButtonStyle.Success),
+          new ButtonBuilder()
+            .setCustomId(`req_reject_break_${interaction.user.id}`)
+            .setLabel('رفض')
+            .setStyle(ButtonStyle.Danger)
+        );
+
+        await requestsChannel.send({ embeds: [embed], components: [decisionRow] });
+
+        return await interaction.reply({
+          content: '✅ تم إرسال طلب كسر الإجازة بنجاح إلى روم المسؤولين، بانتظار مراجعة الإدارة.',
+          ephemeral: true,
+        });
+      }
+    }
+
+    // --------------------------------------------------------
+    // 5. الأوامر (Slash Commands)
+    // --------------------------------------------------------
+    if (interaction.isChatInputCommand()) {
+      // أمر إرسال لوحة الإجازات
+      if (interaction.commandName === 'send_leave_panel') {
         if (!hasStaffRole(interaction.member)) {
-          return interaction.reply({ content: '❌ هذا الأمر للإدارة فقط.', ephemeral: true });
+          return interaction.reply({ content: '❌ هذا الأمر خاص بأصحاب صلاحية الإدارة فقط.', ephemeral: true });
         }
-        const modal = new ModalBuilder()
-          .setCustomId('break_modal')
-          .setTitle('🔓 طلب كسر إجازة');
-        const reasonInput = new TextInputBuilder()
-          .setCustomId('break_reason')
-          .setLabel('السبب')
-          .setStyle(TextInputStyle.Paragraph)
-          .setPlaceholder('اكتب سبب كسر الإجازة')
-          .setRequired(true)
-          .setMaxLength(500);
-        modal.addComponents(new ActionRowBuilder().addComponents(reasonInput));
-        return await interaction.showModal(modal);
+
+        const panelEmbed = new EmbedBuilder()
+          .setTitle('📋 نظام طلبات الإجازات والاستقالات')
+          .setDescription(
+            [
+              'اختر نوع الطلب اللي تبيه من الأزرار تحت:',
+              '',
+              `📄 **طلب إجازة** — لطلب إجازة (بحد أقصى ${MAX_LEAVE_DAYS} أيام) مع ذكر السبب.`,
+              '🔓 **طلب كسر إجازة** — إذا رجعت من إجازتك بدري وتبي توضح السبب.',
+              '📝 **طلب استقالة** — لتقديم طلب استقالة مع ذكر السبب.',
+            ].join('\n')
+          )
+          .setColor(LEAVE_PANEL_COLOR)
+          .setImage(`attachment://${LEAVE_BANNER_FILENAME}`)
+          .setFooter({ text: 'يرجى تعبئة البيانات بدقة قبل الإرسال' })
+          .setTimestamp();
+
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId('open_leave_modal')
+            .setLabel('طلب إجازة')
+            .setEmoji('📄')
+            .setStyle(ButtonStyle.Primary),
+          new ButtonBuilder()
+            .setCustomId('open_break_modal')
+            .setLabel('طلب كسر إجازة')
+            .setEmoji('🔓')
+            .setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder()
+            .setCustomId('open_resign_modal')
+            .setLabel('طلب استقالة')
+            .setEmoji('📝')
+            .setStyle(ButtonStyle.Danger)
+        );
+
+        const bannerFile = new AttachmentBuilder(LEAVE_BANNER_PATH, { name: LEAVE_BANNER_FILENAME });
+
+        try {
+          const panelChannel = await interaction.guild.channels.fetch(LEAVE_EMBED_CHANNEL_ID);
+          await panelChannel.send({ embeds: [panelEmbed], components: [row], files: [bannerFile] });
+
+          return interaction.reply({
+            content: `✅ تم إرسال لوحة الإجازات والاستقالات في روم الإمبد <#${LEAVE_EMBED_CHANNEL_ID}>.`,
+            ephemeral: true,
+          });
+        } catch (err) {
+          console.error('❌ خطأ أثناء إرسال لوحة الاجازات:', err);
+          return interaction.reply({
+            content: '⚠️ ما قدرت أرسل اللوحة. تأكد إن البوت عنده صلاحية إرسال رسائل وصور بذاك الروم.',
+            ephemeral: true,
+          });
+        }
       }
 
-      // 6. عرض الإجازات النشطة
-      if (commandName === 'active_leaves') {
+      // أمر عرض الإجازات النشطة
+      if (interaction.commandName === 'active_leaves') {
         if (!hasStaffRole(interaction.member)) {
-          return interaction.reply({ content: '❌ هذا الأمر للإدارة فقط.', ephemeral: true });
+          return interaction.reply({ content: '❌ هذا الأمر خاص بأصحاب صلاحية الإدارة فقط.', ephemeral: true });
         }
+
         if (activeLeaves.size === 0) {
-          return interaction.reply({ content: '🌴 لا يوجد إداري في إجازة حالياً.', ephemeral: true });
+          return interaction.reply({ content: '🌴 لا يوجد أي إداري في إجازة حالياً.', ephemeral: true });
         }
-        let desc = '';
-        for (const [userId, data] of activeLeaves.entries()) {
-          const remaining = data.endDate - Date.now();
-          if (remaining <= 0) {
+
+        let expiredCount = 0;
+        const now = Date.now();
+        let description = '';
+        let index = 1;
+
+        for (const [userId, leaveData] of activeLeaves.entries()) {
+          if (now > leaveData.endDate) {
             activeLeaves.delete(userId);
-            saveActiveLeaves();
+            expiredCount++;
             continue;
           }
-          const days = Math.floor(remaining / (1000*60*60*24));
-          const hours = Math.floor((remaining % (1000*60*60*24)) / (1000*60*60));
-          desc += `<@${userId}> — متبقي ${days} يوم و ${hours} ساعة\n`;
+
+          const remainingMs = leaveData.endDate - now;
+          const remainingDays = Math.floor(remainingMs / (1000 * 60 * 60 * 24));
+          const remainingHours = Math.floor((remainingMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+
+          let timeText = '';
+          if (remainingDays > 0) timeText += `${remainingDays} يوم و `;
+          timeText += `${remainingHours} ساعة`;
+
+          description += `**${index}.** <@${userId}> — ينتهي بعد: \`${timeText}\`\n`;
+          index++;
         }
+
+        if (expiredCount > 0) saveActiveLeaves();
+
+        if (description === '') {
+          description = '✅ كانت هناك إجازات في السجل ولكن جميعها انتهت الآن.';
+        }
+
         const embed = new EmbedBuilder()
+          .setTitle('قائمة الإجازات النشطة')
           .setColor(0x3ba55d)
-          .setTitle('🌴 الإجازات النشطة')
-          .setDescription(desc || '✅ جميع الإجازات انتهت.')
+          .setDescription(description)
           .setTimestamp();
+
         return interaction.reply({ embeds: [embed] });
       }
 
-      // 7. إحصائيات الـ Done
-      if (commandName === 'done_stats') {
+      // أمر التوب 10
+      if (interaction.commandName === 'top_done') {
         if (!hasStaffRole(interaction.member)) {
-          return interaction.reply({ content: '❌ هذا الأمر للإدارة فقط.', ephemeral: true });
+          return interaction.reply({ content: '❌ هذا الأمر خاص بأصحاب صلاحية الإدارة فقط.', ephemeral: true });
         }
-        if (doneCounts.size === 0) {
-          return interaction.reply({ content: '📊 لا توجد إحصائيات مسجلة.', ephemeral: true });
-        }
-        const sorted = [...doneCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10);
-        const desc = sorted.map(([id, count], i) => `**#${i+1}** <@${id}> — \`${count}\``).join('\n');
+        if (doneCounts.size === 0) return interaction.reply({ content: '📊 ما فيه أي إحصائيات مسجلة حتى الآن.', ephemeral: true });
+
+        const sortedDones = [...doneCounts.entries()]
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 10);
+
+        const description = sortedDones.map(([adminId, count], index) => {
+          const medals = ['🥇', '🥈', '🥉'];
+          const rank = index < 3 ? medals[index] : `**#${index + 1}**`;
+          return `${rank} - <@${adminId}> : \`${count}\` Done`;
+        }).join('\n\n');
+
         const embed = new EmbedBuilder()
+          .setTitle('🏆 توب 10 إداريين (أكثر من ساعد المواطنين)')
           .setColor(0xffd700)
-          .setTitle('🏆 توب 10 إداريين (Done)')
-          .setDescription(desc);
+          .setDescription(description);
+
         return interaction.reply({ embeds: [embed] });
       }
 
-      // 8. نقاط التواجد الخاصة
-      if (commandName === 'points') {
+      // أمر عرض الكل
+      if (interaction.commandName === 'all_dones') {
         if (!hasStaffRole(interaction.member)) {
-          return interaction.reply({ content: '❌ هذا الأمر للإدارة فقط.', ephemeral: true });
+          return interaction.reply({ content: '❌ هذا الأمر خاص بأصحاب صلاحية الإدارة فقط.', ephemeral: true });
         }
-        const data = presencePoints.get(interaction.user.id);
-        const points = data ? data.points : 0;
-        const avgRating = getAdminRatings(interaction.user.id);
-        const embed = new EmbedBuilder()
-          .setColor(0x5865f2)
-          .setTitle('📊 نقاط التواجد')
-          .setDescription(`لديك **${points}** نقطة تواجد.\nمتوسط تقييمك: **${avgRating.avg.toFixed(1)}/5** من ${avgRating.count} تقييم.`);
-        return interaction.reply({ embeds: [embed] });
-      }
+        if (doneCounts.size === 0) return interaction.reply({ content: '📊 ما فيه أي إحصائيات مسجلة حتى الآن.', ephemeral: true });
 
-      // 9. ترتيب النقاط
-      if (commandName === 'points_leaderboard') {
-        if (!hasStaffRole(interaction.member)) {
-          return interaction.reply({ content: '❌ هذا الأمر للإدارة فقط.', ephemeral: true });
-        }
-        const sorted = [...presencePoints.entries()].sort((a, b) => b[1].points - a[1].points).slice(0, 10);
-        if (sorted.length === 0) {
-          return interaction.reply({ content: '📊 لا توجد نقاط مسجلة.', ephemeral: true });
-        }
-        const desc = sorted.map(([id, data], i) => `**#${i+1}** <@${id}> — \`${data.points}\` نقطة`).join('\n');
+        const sortedDones = [...doneCounts.entries()].sort((a, b) => b[1] - a[1]);
+
+        const description = sortedDones.map(([adminId, count], index) => {
+          return `**#${index + 1}** - <@${adminId}> : \`${count}\` Done`;
+        }).join('\n');
+
         const embed = new EmbedBuilder()
+          .setTitle('📊 إحصائيات جميع الإداريين (Done)')
           .setColor(0x3498db)
-          .setTitle('🏅 ترتيب نقاط التواجد')
-          .setDescription(desc);
+          .setDescription(description.length > 4096 ? description.slice(0, 4090) + '...' : description);
+
         return interaction.reply({ embeds: [embed] });
       }
 
-      // 10. إضافة Done (للإدارة العليا)
-      if (commandName === 'add_done') {
+      // إضافة إنجازات
+      if (interaction.commandName === 'add_done') {
         if (!hasStaffRole(interaction.member)) {
-          return interaction.reply({ content: '❌ صلاحية الإدارة مطلوبة.', ephemeral: true });
+          return interaction.reply({ content: '❌ هذا الأمر خاص بأصحاب صلاحية الإدارة العليا فقط.', ephemeral: true });
         }
-        const admin = interaction.options.getUser('admin');
-        const amount = interaction.options.getInteger('amount');
-        const current = doneCounts.get(admin.id) || 0;
-        doneCounts.set(admin.id, current + amount);
-        saveDoneCounts();
-        return interaction.reply({ content: `✅ تم إضافة ${amount} إلى <@${admin.id}> (المجموع: ${current + amount})`, ephemeral: true });
-      }
 
-      // 11. خصم Done
-      if (commandName === 'remove_done') {
-        if (!hasStaffRole(interaction.member)) {
-          return interaction.reply({ content: '❌ صلاحية الإدارة مطلوبة.', ephemeral: true });
-        }
         const admin = interaction.options.getUser('admin');
         const amount = interaction.options.getInteger('amount');
-        const current = doneCounts.get(admin.id) || 0;
-        const newCount = Math.max(0, current - amount);
+
+        const currentCount = doneCounts.get(admin.id) || 0;
+        const newCount = currentCount + amount;
         doneCounts.set(admin.id, newCount);
         saveDoneCounts();
-        return interaction.reply({ content: `✅ تم خصم ${amount} من <@${admin.id}> (المجموع: ${newCount})`, ephemeral: true });
+
+        return interaction.reply({ content: `✅ تم إضافة \`${amount}\` إلى إحصائيات <@${admin.id}>. المجموع الحالي: \`${newCount}\``, ephemeral: true });
       }
 
-      // 12. تصفير الكل
-      if (commandName === 'reset_all') {
+      // خصم إنجازات
+      if (interaction.commandName === 'remove_done') {
         if (!hasStaffRole(interaction.member)) {
-          return interaction.reply({ content: '❌ صلاحية الإدارة مطلوبة.', ephemeral: true });
+          return interaction.reply({ content: '❌ هذا الأمر خاص بأصحاب صلاحية الإدارة العليا فقط.', ephemeral: true });
         }
+
+        const admin = interaction.options.getUser('admin');
+        const amount = interaction.options.getInteger('amount');
+
+        const currentCount = doneCounts.get(admin.id) || 0;
+        const newCount = Math.max(0, currentCount - amount);
+        doneCounts.set(admin.id, newCount);
+        saveDoneCounts();
+
+        return interaction.reply({ content: `✅ تم خصم \`${amount}\` من إحصائيات <@${admin.id}>. المجموع الحالي: \`${newCount}\``, ephemeral: true });
+      }
+
+      // تصفير الإحصائيات
+      if (interaction.commandName === 'reset_all') {
+        if (!hasStaffRole(interaction.member)) {
+          return interaction.reply({ content: '❌ هذا الأمر خاص بأصحاب صلاحية الإدارة العليا فقط.', ephemeral: true });
+        }
+
         doneCounts.clear();
         saveDoneCounts();
-        presencePoints.clear();
-        savePresencePoints();
-        db.prepare('DELETE FROM ratings').run();
-        return interaction.reply({ content: '🧹 تم تصفير جميع الإحصائيات.', ephemeral: true });
+
+        return interaction.reply({ content: '🧹 تم تصفير جميع إحصائيات الـ Done بنجاح!', ephemeral: true });
       }
     }
-
-    // ===== المودالات =====
-    if (interaction.isModalSubmit()) {
-      if (interaction.customId === 'leave_modal') {
-        const duration = parseInt(interaction.fields.getTextInputValue('leave_duration'));
-        const reason = interaction.fields.getTextInputValue('leave_reason');
-        if (duration < 1 || duration > 14) {
-          return interaction.reply({ content: '❌ المدة بين 1 و 14 يوماً.', ephemeral: true });
-        }
-        const endDate = Date.now() + duration * 24 * 60 * 60 * 1000;
-        activeLeaves.set(interaction.user.id, { endDate });
-        saveActiveLeaves();
-        // إضافة رتبة الإجازة (اختياري)
-        try {
-          const member = await interaction.guild.members.fetch(interaction.user.id);
-          const leaveRoleId = '1459304469127758027'; // غيرها حسب رتبتك
-          await member.roles.add(leaveRoleId);
-        } catch (e) {}
-        return interaction.reply({ content: `✅ تم قبول إجازتك لمدة ${duration} يوماً.`, ephemeral: true });
-      }
-      if (interaction.customId === 'resign_modal') {
-        // معالجة الاستقالة
-        return interaction.reply({ content: '📝 تم تقديم طلب الاستقالة.', ephemeral: true });
-      }
-      if (interaction.customId === 'break_modal') {
-        if (activeLeaves.has(interaction.user.id)) {
-          activeLeaves.delete(interaction.user.id);
-          saveActiveLeaves();
-          // إزالة رتبة الإجازة
-          try {
-            const member = await interaction.guild.members.fetch(interaction.user.id);
-            const leaveRoleId = '1459304469127758027';
-            await member.roles.remove(leaveRoleId);
-          } catch (e) {}
-          return interaction.reply({ content: '✅ تم كسر الإجازة والعودة للعمل.', ephemeral: true });
-        }
-        return interaction.reply({ content: '❌ أنت لست في إجازة حالياً.', ephemeral: true });
-      }
-    }
-
   } catch (error) {
-    console.error('❌ خطأ في التفاعل:', error);
+    console.error('❌ خطأ أثناء معالجة التفاعل:', error);
     if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: '❌ حدث خطأ.', ephemeral: true }).catch(() => null);
+      await interaction.reply({ content: '❌ حدث خطأ أثناء معالجة الطلب.', ephemeral: true }).catch(() => null);
     }
   }
 });
