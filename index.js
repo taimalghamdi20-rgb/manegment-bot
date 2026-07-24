@@ -29,25 +29,39 @@ db.exec(`
     user_id TEXT PRIMARY KEY,
     end_date INTEGER
   );
+  CREATE TABLE IF NOT EXISTS presence_points (
+    admin_id TEXT PRIMARY KEY,
+    points INTEGER DEFAULT 0,
+    last_update INTEGER
+  );
+  CREATE TABLE IF NOT EXISTS ratings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    admin_id TEXT,
+    citizen_id TEXT,
+    rating INTEGER,
+    timestamp INTEGER
+  );
 `);
 
-// ===== قراءة المتغيرات من بيئة التشغيل (بدون .env) =====
+// ===== قراءة المتغيرات من بيئة التشغيل =====
 const {
   BOT_TOKEN,
   GUILD_ID,
   WAITING_CHANNEL_ID,
   ADMIN_ROLE_ID,
   CITIZEN_ROLE_ID,
+  SUPPORT_CATEGORY_ID,
+  DONE_VOICE_CHANNEL_ID,
+  LOG_CHANNEL_ID,
 } = process.env;
 
-// فحص المتغيرات الأساسية
 if (!BOT_TOKEN || !GUILD_ID || !WAITING_CHANNEL_ID || !ADMIN_ROLE_ID) {
   console.error('❌ تأكد من تعبئة المتغيرات التالية في بيئة التشغيل:');
   console.error('BOT_TOKEN, GUILD_ID, WAITING_CHANNEL_ID, ADMIN_ROLE_ID');
   process.exit(1);
 }
 
-// ===== إضافة رومات الانتظار الإضافية (ثابتة) =====
+// ===== إضافة رومات الانتظار الإضافية =====
 const ADDITIONAL_WAITING_IDS = [
   '1481398869463138604',
   '1519511668823167116'
@@ -58,7 +72,7 @@ const WAITING_CHANNEL_IDS = [
   ...ADDITIONAL_WAITING_IDS
 ];
 
-// ===== إعدادات ثابتة (لا تحتاج إلى env) =====
+// ===== إعدادات ثابتة =====
 const RATING_CHANNEL_ID = '1529482677516898555';
 const LEAVE_EMBED_CHANNEL_ID = '1529495796247167178';
 const LEAVE_PANEL_CHANNEL_ID = '1529440458030321714';
@@ -66,6 +80,7 @@ const LEAVE_ROLE_ID = '1459304469127758027';
 const RESIGNATION_KEEP_ROLE_ID = '1476796533168017428';
 const STAFF_ROLE_IDS = ['1459304407899443396', '1459304410923532481'];
 const DONE_TEXT_CHANNEL_ID = '1529933848144510976';
+const BOARD_CHANNEL_ID = '1529933848144510976'; // نفس روم الإدارة أو روم مخصص للبورد
 
 const ADMIN_ROOM_IDS = [
   '1499105265272754246',
@@ -124,9 +139,42 @@ function saveActiveLeaves() {
   trans(activeLeaves.entries());
 }
 
+// ===== دوال نقاط التواجد =====
+function loadPresencePoints() {
+  const stmt = db.prepare('SELECT admin_id, points, last_update FROM presence_points');
+  const rows = stmt.all();
+  const map = new Map();
+  for (const row of rows) {
+    map.set(row.admin_id, { points: row.points, lastUpdate: row.last_update });
+  }
+  return map;
+}
+
+function savePresencePoints() {
+  db.prepare('DELETE FROM presence_points').run();
+  const insert = db.prepare('INSERT INTO presence_points (admin_id, points, last_update) VALUES (?, ?, ?)');
+  const trans = db.transaction((entries) => {
+    for (const [id, data] of entries) {
+      insert.run(id, data.points, data.lastUpdate);
+    }
+  });
+  trans(presencePoints.entries());
+}
+
+function saveRating(adminId, citizenId, rating) {
+  const insert = db.prepare('INSERT INTO ratings (admin_id, citizen_id, rating, timestamp) VALUES (?, ?, ?, ?)');
+  insert.run(adminId, citizenId, rating, Date.now());
+}
+
+function getAdminRatings(adminId) {
+  const stmt = db.prepare('SELECT AVG(rating) as avg_rating, COUNT(*) as total FROM ratings WHERE admin_id = ?');
+  return stmt.get(adminId);
+}
+
 // تحميل البيانات
 const doneCounts = loadDoneCounts();
 const activeLeaves = loadActiveLeaves();
+const presencePoints = loadPresencePoints();
 const evaluatedLogs = new Set();
 
 // ===== دوال مساعدة =====
@@ -159,13 +207,23 @@ function isDeafened(vs) {
   return vs.selfDeaf || vs.serverDeaf;
 }
 
-// ===== دوال السحب =====
+// ===== دوال الطابور الذكي =====
+const waitQueue = [];
+const activeSessions = new Map();
+const presenceTimers = new Map();
+
 function getNextEligibleWaitingMember(guild) {
   for (const waitingId of WAITING_CHANNEL_IDS) {
     const channel = guild.channels.cache.get(waitingId);
     if (!channel || !channel.members) continue;
     for (const [, member] of channel.members) {
-      if (!isMutedOrDeafened(member.voice)) return member;
+      if (!isMutedOrDeafened(member.voice)) {
+        // إضافة إلى الطابور إذا لم يكن موجوداً
+        if (!waitQueue.includes(member.id)) {
+          waitQueue.push(member.id);
+        }
+        return member;
+      }
     }
   }
   return null;
@@ -180,26 +238,88 @@ function isFreeAdminRoom(channel) {
   return true;
 }
 
-const pullLocks = new Set();
-const activeSessions = new Map();
-
-async function tryPullForAllFreeAdmins(guild) {
-  for (const roomId of ADMIN_ROOM_IDS) {
-    const channel = guild.channels.cache.get(roomId);
-    if (!channel || !isFreeAdminRoom(channel) || pullLocks.has(channel.id)) continue;
-    const candidate = getNextEligibleWaitingMember(guild);
-    if (!candidate) continue;
-    pullLocks.add(channel.id);
-    try {
-      const admin = channel.members.first();
-      await candidate.voice.setChannel(channel.id, 'سحب تلقائي');
-      activeSessions.set(candidate.id, { adminId: admin.id, startTime: Date.now() });
-      console.log(`✅ تم سحب ${candidate.user.tag} إلى ${channel.name} (الإداري: ${admin.user.tag})`);
-    } catch (err) {
-      console.error(`⚠️ فشل سحب ${candidate.user.tag}:`, err.message);
-    } finally {
-      pullLocks.delete(channel.id);
+// ===== نظام نقاط التواجد =====
+function startPresenceTimer(adminId, guild) {
+  if (presenceTimers.has(adminId)) return;
+  
+  const timer = setInterval(async () => {
+    const member = await guild.members.fetch(adminId).catch(() => null);
+    if (!member) {
+      stopPresenceTimer(adminId);
+      return;
     }
+    
+    const voiceState = member.voice;
+    if (!voiceState.channel || isDeafened(voiceState)) {
+      stopPresenceTimer(adminId);
+      return;
+    }
+    
+    // تحديث النقاط كل 15 دقيقة
+    const now = Date.now();
+    const data = presencePoints.get(adminId) || { points: 0, lastUpdate: now };
+    const timeDiff = now - (data.lastUpdate || now);
+    
+    if (timeDiff >= 15 * 60 * 1000) { // 15 دقيقة
+      data.points += 1;
+      data.lastUpdate = now;
+      presencePoints.set(adminId, data);
+      savePresencePoints();
+      
+      console.log(`🟢 تم إضافة نقطة تواجد للإداري <@${adminId}> (المجموع: ${data.points})`);
+    }
+  }, 60 * 1000); // فحص كل دقيقة
+  
+  presenceTimers.set(adminId, timer);
+}
+
+function stopPresenceTimer(adminId) {
+  if (presenceTimers.has(adminId)) {
+    clearInterval(presenceTimers.get(adminId));
+    presenceTimers.delete(adminId);
+  }
+}
+
+// ===== دوال البورد المباشر =====
+let boardMessage = null;
+
+async function updateBoard(guild) {
+  const channel = guild.channels.cache.get(BOARD_CHANNEL_ID);
+  if (!channel) return;
+
+  const waitingCount = waitQueue.length;
+  const status = waitingCount > 0 ? '🟡 Busy' : '🟢 Available';
+
+  const embed = new EmbedBuilder()
+    .setColor(0x2b2d31)
+    .setTitle('# Emperors Town RP')
+    .setDescription(`- Live Support Board\n- Live Support Board`)
+    .addFields(
+      { name: '**Support Status:**', value: status, inline: false },
+      { name: '**Players Waiting:**', value: `**${waitingCount}**`, inline: false },
+      { name: '**Current Waiting List:**', value: waitQueue.length > 0 
+        ? waitQueue.map((id, i) => `${i+1}. <@${id}>`).join('\n')
+        : '`لا يوجد لاعبين ينتظرون`', 
+        inline: false }
+    )
+    .setFooter({ text: 'Live board - updates automatically' })
+    .setTimestamp();
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('refresh_board')
+      .setLabel('🔄 تحديث')
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  if (boardMessage) {
+    try {
+      await boardMessage.edit({ embeds: [embed], components: [row] });
+    } catch (e) {
+      boardMessage = await channel.send({ embeds: [embed], components: [row] });
+    }
+  } else {
+    boardMessage = await channel.send({ embeds: [embed], components: [row] });
   }
 }
 
@@ -227,7 +347,7 @@ client.on(Events.MessageCreate, async (message) => {
 });
 
 // ============================================================
-// تسجيل الأوامر (تم إصلاح الخطأ بإضافة وصف للخيارات)
+// تسجيل الأوامر
 // ============================================================
 client.once(Events.ClientReady, async (c) => {
   console.log(`🤖 البوت شغال باسم ${c.user.tag}`);
@@ -253,23 +373,78 @@ client.once(Events.ClientReady, async (c) => {
           { name: 'amount', description: 'عدد الـ Done للخصم', type: 4, required: true }
         ] 
       },
-      { name: 'reset_all', description: 'تصفير جميع إحصائيات الـ Done' }
+      { name: 'reset_all', description: 'تصفير جميع إحصائيات الـ Done' },
+      { name: 'board', description: 'إرسال لوحة الدعم المباشرة' },
+      { name: 'points', description: 'عرض نقاط التواجد للإداريين' },
     ];
     await c.application.commands.set(commands, GUILD_ID);
     console.log('✅ تم تسجيل الأوامر.');
+    
+    // تحديث البورد بعد 5 ثواني
+    setTimeout(async () => {
+      await updateBoard(c.guilds.cache.get(GUILD_ID));
+    }, 5000);
+    
   } catch (error) {
     console.error('❌ خطأ في تسجيل الأوامر:', error);
   }
 });
 
 // ============================================================
-// حركة الصوت – التسجيل الفوري للـ Done
+// حركة الصوت
 // ============================================================
 client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
   const guild = newState.guild || oldState.guild;
   if (!guild || guild.id !== GUILD_ID) return;
   const userId = newState.id;
 
+  // ===== نظام الطابور =====
+  // إزالة من الطابور إذا غادر روم الانتظار أو دخل روم إداري
+  if (oldState.channelId && WAITING_CHANNEL_IDS.includes(oldState.channelId)) {
+    const index = waitQueue.indexOf(userId);
+    if (index > -1) {
+      waitQueue.splice(index, 1);
+      await updateBoard(guild);
+    }
+  }
+
+  // إضافة إلى الطابور إذا دخل روم الانتظار
+  if (newState.channelId && WAITING_CHANNEL_IDS.includes(newState.channelId)) {
+    if (!waitQueue.includes(userId) && !isMutedOrDeafened(newState)) {
+      waitQueue.push(userId);
+      await updateBoard(guild);
+      
+      // إرسال رسالة تنبيه للمواطن
+      try {
+        const user = await client.users.fetch(userId);
+        const embed = new EmbedBuilder()
+          .setColor(0x5865f2)
+          .setTitle('🎙️ Emperors Town RP')
+          .setDescription('**استعد لجلسة الدعم**\nسيتم نقلك إلى روم الدعم (Support) بعد لحظات.\n\nجهز ملاحظاتك وأسئلتك قبل بدء الجلسة.')
+          .setFooter({ text: 'Emperors Town RP' })
+          .setTimestamp();
+        await user.send({ embeds: [embed] });
+      } catch (e) { /* تجاهل الأخطاء */ }
+    }
+  }
+
+  // ===== نظام نقاط التواجد =====
+  // بدء المؤقت إذا دخل الإداري روم دعم
+  if (newState.channelId && ADMIN_ROOM_IDS.includes(newState.channelId)) {
+    const member = await guild.members.fetch(userId).catch(() => null);
+    if (member && member.roles.cache.has(ADMIN_ROLE_ID) && !isDeafened(newState)) {
+      startPresenceTimer(userId, guild);
+    }
+  }
+
+  // إيقاف المؤقت إذا غادر الإداري أو ديفن
+  if (oldState.channelId && ADMIN_ROOM_IDS.includes(oldState.channelId)) {
+    if (isDeafened(newState) || !newState.channelId) {
+      stopPresenceTimer(userId);
+    }
+  }
+
+  // ===== نظام الـ Done والتقييم =====
   if (activeSessions.has(userId) && newState.channelId !== oldState.channelId) {
     const { adminId, startTime } = activeSessions.get(userId);
     activeSessions.delete(userId);
@@ -279,29 +454,48 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
     const secs = durationSec % 60;
     const durationText = mins > 0 ? `${mins} دقيقة و ${secs} ثانية` : `${secs} ثانية`;
 
+    // تحديث الـ Done
     const current = (doneCounts.get(adminId) || 0) + 1;
     doneCounts.set(adminId, current);
     saveDoneCounts();
 
+    // إرسال سجل الـ Done
     let logMsg = null;
     try {
       const channel = guild.channels.cache.get(DONE_TEXT_CHANNEL_ID);
       if (channel) {
         const embed = new EmbedBuilder()
           .setColor(0x57f287)
-          .setTitle('✅ تم إنهاء خدمة مواطن (Done)')
+          .setTitle('✅ انتهاء الدعم')
+          .setDescription('قام الإداري بإنهاء حالة الدعم الخاصة بك وتم نقلك إلى روم الانتهاء.')
           .addFields(
-            { name: '👤 المواطن', value: `<@${userId}>`, inline: true },
-            { name: '🛡️ الإداري', value: `<@${adminId}>`, inline: true },
-            { name: '📊 مجموع الـ Done', value: `\`${current}\``, inline: true },
-            { name: '⏱️ المدة', value: `\`${durationText}\``, inline: true },
-            { name: '⭐ التقييم', value: '⏳ بانتظار تقييم المواطن...', inline: false }
+            { name: 'الإداري', value: `<@${adminId}>`, inline: true },
+            { name: 'الوقت المستغرق', value: `\`${durationText}\``, inline: true },
+            { name: 'تقييم الدعم الفني', value: 'هل أنت راضي عن جودة الدعم الذي تلقيه؟', inline: false }
           )
+          .setImage('attachment://server_logo.png')
           .setTimestamp();
-        logMsg = await channel.send({ embeds: [embed] });
+        
+        // زر التقييم
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`rate_satisfied_${adminId}`)
+            .setLabel('راضي')
+            .setStyle(ButtonStyle.Success)
+            .setEmoji('🟢'),
+          new ButtonBuilder()
+            .setCustomId(`rate_unsatisfied_${adminId}`)
+            .setLabel('غير راضي')
+            .setStyle(ButtonStyle.Danger)
+            .setEmoji('🔴')
+        );
+        
+        const file = new AttachmentBuilder(SERVER_LOGO_PATH, { name: 'server_logo.png' });
+        logMsg = await channel.send({ embeds: [embed], components: [row], files: [file] });
       }
     } catch (e) { console.error('❌ خطأ في إرسال سجل الـ Done:', e); }
 
+    // إرسال رسالة تقييم خاصة للمواطن
     try {
       const user = await client.users.fetch(userId);
       const logId = logMsg ? logMsg.id : 'none';
@@ -321,7 +515,7 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
         try {
           const embed = EmbedBuilder.from(logMsg.embeds[0]);
           const fields = embed.data.fields;
-          fields[4].value = '❌ الخاص مغلق (لم يتم التقييم)';
+          fields[2].value = '❌ الخاص مغلق (لم يتم التقييم)';
           embed.setFields(fields);
           await logMsg.edit({ embeds: [embed] });
         } catch (e) {}
@@ -329,17 +523,61 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
     }
   }
 
-  try { await tryPullForAllFreeAdmins(guild); } catch (e) { console.error('خطأ في السحب:', e); }
+  // محاولة السحب التلقائي
+  try {
+    const pullResult = await tryPullForAllFreeAdmins(guild);
+    if (pullResult) {
+      await updateBoard(guild);
+    }
+  } catch (e) { console.error('خطأ في السحب:', e); }
 });
 
+// ===== دوال السحب =====
+const pullLocks = new Set();
+
+async function tryPullForAllFreeAdmins(guild) {
+  let pulled = false;
+  for (const roomId of ADMIN_ROOM_IDS) {
+    const channel = guild.channels.cache.get(roomId);
+    if (!channel || !isFreeAdminRoom(channel) || pullLocks.has(channel.id)) continue;
+    
+    const candidate = getNextEligibleWaitingMember(guild);
+    if (!candidate) continue;
+    
+    pullLocks.add(channel.id);
+    try {
+      const admin = channel.members.first();
+      await candidate.voice.setChannel(channel.id, 'سحب تلقائي');
+      
+      // إزالة من الطابور
+      const index = waitQueue.indexOf(candidate.id);
+      if (index > -1) waitQueue.splice(index, 1);
+      
+      activeSessions.set(candidate.id, { adminId: admin.id, startTime: Date.now() });
+      console.log(`✅ تم سحب ${candidate.user.tag} إلى ${channel.name} (الإداري: ${admin.user.tag})`);
+      pulled = true;
+    } catch (err) {
+      console.error(`⚠️ فشل سحب ${candidate.user.tag}:`, err.message);
+    } finally {
+      pullLocks.delete(channel.id);
+    }
+  }
+  return pulled;
+}
+
 // ============================================================
-// التفاعلات (الأزرار، المودالات، الأوامر) – الكود الكامل
+// التفاعلات
 // ============================================================
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
-    // --------------------------------------------------------
-    // 1. أزرار التقييم (rate_*)
-    // --------------------------------------------------------
+    // ===== زر تحديث البورد =====
+    if (interaction.isButton() && interaction.customId === 'refresh_board') {
+      await interaction.deferUpdate();
+      await updateBoard(interaction.guild);
+      return;
+    }
+
+    // ===== أزرار التقييم (النجوم) =====
     if (interaction.isButton() && interaction.customId.startsWith('rate_')) {
       const parts = interaction.customId.split('_');
       const rating = parseInt(parts[1]);
@@ -352,6 +590,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       evaluatedLogs.add(logId);
       await interaction.update({ content: `✅ شكراً! (${stars})`, embeds: [], components: [] });
+
+      // حفظ التقييم
+      saveRating(adminId, interaction.user.id, rating);
 
       try {
         const guild = client.guilds.cache.get(GUILD_ID);
@@ -382,7 +623,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
             if (msg) {
               const embed = EmbedBuilder.from(msg.embeds[0]);
               const fields = embed.data.fields;
-              fields[4].value = stars;
+              // تحديث حقل التقييم
+              if (fields.length > 2) {
+                fields[2].value = stars;
+              }
               embed.setFields(fields);
               await msg.edit({ embeds: [embed] });
             }
@@ -392,9 +636,66 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    // --------------------------------------------------------
-    // 2. أزرار فتح المودالات (طلب إجازة، استقالة، كسر إجازة)
-    // --------------------------------------------------------
+    // ===== أزرار راضي/غير راضي =====
+    if (interaction.isButton() && interaction.customId.startsWith('rate_satisfied_')) {
+      const adminId = interaction.customId.split('_')[2];
+      await interaction.update({ content: '✅ شكراً لتقييمك!', components: [] });
+      
+      // حفظ التقييم كـ 5 نجوم
+      saveRating(adminId, interaction.user.id, 5);
+      
+      try {
+        const guild = client.guilds.cache.get(GUILD_ID);
+        const channel = guild.channels.cache.get(RATING_CHANNEL_ID);
+        if (channel) {
+          const file = new AttachmentBuilder(SERVER_LOGO_PATH, { name: SERVER_LOGO_FILENAME });
+          const embed = new EmbedBuilder()
+            .setColor(0x2ecc71)
+            .setAuthor({ name: `${interaction.user.username} قيّم الخدمة`, iconURL: interaction.user.displayAvatarURL() })
+            .setTitle('🌟 تقييم إداري')
+            .setThumbnail(`attachment://${SERVER_LOGO_FILENAME}`)
+            .addFields(
+              { name: 'المواطن', value: `<@${interaction.user.id}>`, inline: true },
+              { name: 'الإداري', value: `<@${adminId}>`, inline: true },
+              { name: '⭐ التقييم', value: '⭐⭐⭐⭐⭐\n`5/5` — **ممتاز**', inline: false }
+            )
+            .setTimestamp();
+          await channel.send({ embeds: [embed], files: [file] });
+        }
+      } catch (e) { console.error('❌ خطأ في إرسال التقييم:', e); }
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith('rate_unsatisfied_')) {
+      const adminId = interaction.customId.split('_')[2];
+      await interaction.update({ content: '❌ تم تسجيل ملاحظتك، شكراً لك.', components: [] });
+      
+      // حفظ التقييم كـ 1 نجمة
+      saveRating(adminId, interaction.user.id, 1);
+      
+      try {
+        const guild = client.guilds.cache.get(GUILD_ID);
+        const channel = guild.channels.cache.get(RATING_CHANNEL_ID);
+        if (channel) {
+          const file = new AttachmentBuilder(SERVER_LOGO_PATH, { name: SERVER_LOGO_FILENAME });
+          const embed = new EmbedBuilder()
+            .setColor(0xed4245)
+            .setAuthor({ name: `${interaction.user.username} قيّم الخدمة`, iconURL: interaction.user.displayAvatarURL() })
+            .setTitle('🌟 تقييم إداري')
+            .setThumbnail(`attachment://${SERVER_LOGO_FILENAME}`)
+            .addFields(
+              { name: 'المواطن', value: `<@${interaction.user.id}>`, inline: true },
+              { name: 'الإداري', value: `<@${adminId}>`, inline: true },
+              { name: '⭐ التقييم', value: '⭐\n`1/5` — **ضعيف جداً**', inline: false }
+            )
+            .setTimestamp();
+          await channel.send({ embeds: [embed], files: [file] });
+        }
+      } catch (e) { console.error('❌ خطأ في إرسال التقييم:', e); }
+      return;
+    }
+
+    // ===== باقي الأزرار (طلب إجازة، استقالة، كسر إجازة) =====
     if (interaction.customId === 'open_leave_modal') {
       const modal = new ModalBuilder()
         .setCustomId('leave_modal')
@@ -463,9 +764,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    // --------------------------------------------------------
-    // 3. أزرار قبول/رفض الطلبات
-    // --------------------------------------------------------
+    // ===== أزرار قبول/رفض الطلبات =====
     if (interaction.customId.startsWith('req_accept_') || interaction.customId.startsWith('req_reject_')) {
       if (!hasStaffRole(interaction.member)) {
         return interaction.reply({
@@ -568,9 +867,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    // --------------------------------------------------------
-    // 4. المودالات (النماذج)
-    // --------------------------------------------------------
+    // ===== المودالات =====
     if (interaction.isModalSubmit()) {
       const requestsChannel = await interaction.guild.channels.fetch(LEAVE_PANEL_CHANNEL_ID);
 
@@ -686,11 +983,47 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
     }
 
-    // --------------------------------------------------------
-    // 5. الأوامر (Slash Commands)
-    // --------------------------------------------------------
+    // ===== الأوامر =====
     if (interaction.isChatInputCommand()) {
-      // أمر إرسال لوحة الإجازات
+      // أمر البورد
+      if (interaction.commandName === 'board') {
+        if (!hasStaffRole(interaction.member)) {
+          return interaction.reply({ content: '❌ هذا الأمر خاص بأصحاب صلاحية الإدارة فقط.', ephemeral: true });
+        }
+        await updateBoard(interaction.guild);
+        return interaction.reply({ content: '✅ تم تحديث لوحة الدعم المباشرة.', ephemeral: true });
+      }
+
+      // أمر نقاط التواجد
+      if (interaction.commandName === 'points') {
+        if (!hasStaffRole(interaction.member)) {
+          return interaction.reply({ content: '❌ هذا الأمر خاص بأصحاب صلاحية الإدارة فقط.', ephemeral: true });
+        }
+        
+        if (presencePoints.size === 0) {
+          return interaction.reply({ content: '📊 لا توجد نقاط تواجد مسجلة بعد.', ephemeral: true });
+        }
+
+        const sortedPoints = [...presencePoints.entries()]
+          .sort((a, b) => b[1].points - a[1].points)
+          .slice(0, 10);
+
+        const description = sortedPoints.map(([adminId, data], index) => {
+          const medals = ['🥇', '🥈', '🥉'];
+          const rank = index < 3 ? medals[index] : `**#${index + 1}**`;
+          return `${rank} - <@${adminId}> : \`${data.points}\` نقطة`;
+        }).join('\n\n');
+
+        const embed = new EmbedBuilder()
+          .setTitle('🏆 توب 10 إداريين (نقاط التواجد)')
+          .setColor(0xffd700)
+          .setDescription(description)
+          .setTimestamp();
+
+        return interaction.reply({ embeds: [embed] });
+      }
+
+      // الأمر send_leave_panel
       if (interaction.commandName === 'send_leave_panel') {
         if (!hasStaffRole(interaction.member)) {
           return interaction.reply({ content: '❌ هذا الأمر خاص بأصحاب صلاحية الإدارة فقط.', ephemeral: true });
@@ -749,7 +1082,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
       }
 
-      // أمر عرض الإجازات النشطة
+      // أمر الإجازات النشطة
       if (interaction.commandName === 'active_leaves') {
         if (!hasStaffRole(interaction.member)) {
           return interaction.reply({ content: '❌ هذا الأمر خاص بأصحاب صلاحية الإدارة فقط.', ephemeral: true });
