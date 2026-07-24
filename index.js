@@ -65,7 +65,7 @@ const LEAVE_PANEL_CHANNEL_ID = '1529440458030321714';
 const LEAVE_ROLE_ID = '1459304469127758027';
 const RESIGNATION_KEEP_ROLE_ID = '1476796533168017428';
 const STAFF_ROLE_IDS = ['1459304407899443396', '1459304410923532481'];
-const DONE_TEXT_CHANNEL_ID = '1529933848144510976'; // روم الإدارة
+const DONE_TEXT_CHANNEL_ID = '1529933848144510976';
 
 const ADMIN_ROOM_IDS = [
   '1499105265272754246',
@@ -227,7 +227,7 @@ client.on(Events.MessageCreate, async (message) => {
 });
 
 // ============================================================
-// تسجيل الأوامر
+// تسجيل الأوامر (تم إصلاح الخطأ بإضافة وصف للخيارات)
 // ============================================================
 client.once(Events.ClientReady, async (c) => {
   console.log(`🤖 البوت شغال باسم ${c.user.tag}`);
@@ -237,8 +237,22 @@ client.once(Events.ClientReady, async (c) => {
       { name: 'active_leaves', description: 'عرض قائمة الإداريين المجازين' },
       { name: 'top_done', description: 'عرض أكثر 10 إداريين إنجازاً' },
       { name: 'all_dones', description: 'عرض إحصائيات جميع الإداريين' },
-      { name: 'add_done', description: 'إضافة عدد من الـ Done لإداري', options: [{ name: 'admin', type: 6, required: true }, { name: 'amount', type: 4, required: true }] },
-      { name: 'remove_done', description: 'خصم عدد من الـ Done من إداري', options: [{ name: 'admin', type: 6, required: true }, { name: 'amount', type: 4, required: true }] },
+      { 
+        name: 'add_done', 
+        description: 'إضافة عدد من الـ Done لإداري', 
+        options: [
+          { name: 'admin', description: 'اختر الإداري', type: 6, required: true },
+          { name: 'amount', description: 'عدد الـ Done للإضافة', type: 4, required: true }
+        ] 
+      },
+      { 
+        name: 'remove_done', 
+        description: 'خصم عدد من الـ Done من إداري', 
+        options: [
+          { name: 'admin', description: 'اختر الإداري', type: 6, required: true },
+          { name: 'amount', description: 'عدد الـ Done للخصم', type: 4, required: true }
+        ] 
+      },
       { name: 'reset_all', description: 'تصفير جميع إحصائيات الـ Done' }
     ];
     await c.application.commands.set(commands, GUILD_ID);
